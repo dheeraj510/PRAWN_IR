@@ -1,0 +1,415 @@
+#require File.expand_path(File.join(File.dirname(__FILE__),%w[.. example_helper]))
+require 'dbconnect.rb'
+require "rubygems"
+require "active_record"
+require "action_mailer"
+require "irissapiDB"
+require "prawn"
+require "apcodes.rb"
+
+puts AIRPORTS["AAL"]
+
+def agent_address(id)
+
+  with_db do |db|
+    res = db.query("select USER_ID,ORG_UID,BR_UID from ORG_USER where UID = '#{id}'")
+    row = res.fetch_row
+    puts row.inspect
+    org_uid =  row[0]
+    puts row[1].inspect
+    org_details = db.query("select ORG_UID,BRANCH_NAME,ADDRESS1,ADDRESS2,CITY,STATE,COUNTRY,PINCODE,EMAIL,PHONE,FAX from ORG_BRANCH where UID = '#{row[2]}'")
+    row1 = org_details.fetch_row
+    puts row1.inspect
+    entity_id = row1[0]
+    entity_details = db.query("select ORG_NAME from ORG_ENTITY where UID = '#{entity_id}'")
+    row2 = entity_details.fetch_row
+    agent_hash = {:agent_name=>org_uid,:branch_name=>row1[1],:entity_name=>row2[0],:addr1=>row1[2],:addr2=>row1[3],:city=>row1[4],:state=>row1[5],:country=>row1[6],:pin=>row1[7],:email=>row1[8],:phone=>row1[9],:fax=>row1[10]}
+    return agent_hash
+  end
+end
+
+class PrintTicket
+  GAP = 5
+  BASE_DIR = "/home/dheeraj/project/portico-api/tmp"
+  IMG = BASE_DIR + "/images"
+  TERMS = BASE_DIR + "/terms"
+  def initialize( gdsPnr)
+    #@orgUid = orgUid
+    @gdsPnr = gdsPnr
+    @record = PnrSegPax.all(:conditions => "vendor_pnr = '#{gdsPnr}'")
+  end
+
+  def writeAgentHeader(pdf)
+    pdf.image "#{ IMG}/amexlogo.jpeg", :width => 190, :height => 45, :at => [0,780]
+    pdf.font_size(9)#global font
+    time = Time.new
+    pdf.draw_text "Itinerary generated #{time.strftime("%a, %d %B %Y %H:%M:%S")}" , :size => 8, :at => [349,765]
+    pdf.draw_text "Any changes made after this time are not reflected below", :size => 8, :at => [324,755]
+    pdf.move_down 60
+  end
+
+  def writeAgentDetails(pdf)
+    pdf.bounding_box([GAP, pdf.cursor], :width => 520) do
+      
+      pdf.text "Travel Arrangements for #{@record[0].LAST_NAME}/#{@record[0].FIRST_NAME}#{@record[0].TITLE.upcase}  ", :size => 13
+      pdf.move_down 15
+      # # Corp details on left START
+      pdf.bounding_box([0, pdf.cursor], :width => 230) do
+        
+        
+        pdf.formatted_text [ { :text => "Booking Referance ",   :styles => [:bold] }, 
+                 { :text => "   #{@record[0].VENDOR_PNR}",  :styles => [:bold],:color => "0B6CCF",:size => 10 }]
+          
+        #   # Agent details on Right [START]
+        pdf.bounding_box([GAP  * 50, pdf.bounds.top], :width => 280) do
+          agent_hash = agent_address(@record[0].CREATED_BY)
+          pdf.text "#{agent_hash[:agent_name]} ", :style => :bold
+          pdf.move_down 2
+          pdf.stroke_horizontal_rule
+          pdf.move_down 10
+          pdf.text   "#{agent_hash[:branch_name]}"
+          pdf.text   "#{agent_hash[:entity_name]}"
+          pdf.text   "#{agent_hash[:addr1]}"
+          pdf.text   "#{agent_hash[:addr2]}"
+          pdf.text   "#{agent_hash[:city]}"
+          pdf.text   "#{agent_hash[:state]} #{agent_hash[:country]}#{ agent_hash[:pin]}"
+          pdf.text   "Email #{agent_hash[:email]}"
+          pdf.text   "Phone #{agent_hash[:phone]}"
+          pdf.text   "Facsimile #{agent_hash[:fax]}"
+
+          # pdf.text   "#{@static_arr[0][11]}"
+          # pdf.text   "#{@static_arr[0][12]}"
+          # pdf.text   "#{@static_arr[0][13]}"
+          pdf.move_down 20
+
+        end# Agent details on Right [END]
+      end# Corp details on left [END]
+    end#END of Agent block
+
+  end
+
+  def writeTravelDetails(pdf)
+
+    i=0
+    @record.each do |record|
+      left_details = lambda{
+        flight_names = {"6E"=>"IndiGo","SG"=>"Spice Jet","G8"=>"Jet Airways (India) Limited"}
+
+        pdf. formatted_text [{:text =>"Airline                           "}, {:text => "#{flight_names[record.SUPPLIER_CDE]}", :styles => [:bold]}]
+        pdf. formatted_text [{:text =>"Flight                           "}, {:text => " #{record.FLIGHT_NUM }", :styles => [:bold]}]
+       
+        pdf.text "Orgin                            #{AIRPORTS[record.SRC_AP_CDE_OR_CITY_CDE][0..45]}"
+        pdf.text "Destination                   #{ AIRPORTS[record.DEST_AP_CDE]}"
+        pdf.text "Departing                     #{record.DEPT_OR_CHECKIN.strftime("%H:%M")}"
+        pdf.text "Arriving                        #{record.ARR_OR_CHECKOUT.strftime("%H:%M")}"
+        pdf.move_down 10
+        pdf.text "Departure Terminal      #{record.ARR_TERMINAL}"
+        pdf.text "Arrival Terminal          #{record.DEP_TERMINAL} "
+        pdf.text "Class                            #{fareclass.chomp}"
+      }
+      right_details = lambda{
+        booking_status = {"HK"=>"Confirmed","HX"=>"Cancelled"}
+        meal_hash = {"VGML"=>"Veg Meal","NVML"=>"Non Veg Meal"}
+        meals = record.PNR_BREAK_UP.find_by_BREAK_UP_CDE('ML')
+        meals = meals.BREAK_UP_DESC if meals!= nil
+        est_time = estimated_time(record.ARR_OR_CHECKOUT,record.DEPT_OR_CHECKIN)
+        pdf.text "#{booking_status[record.STATUS]}",:style=> :bold
+        pdf.text "Estimated Time        #{est_time[:hours]} Hrs #{est_time[:minutes]}Mns "
+        pdf.text "Aircraft                     #{record.AIRCRAFT}"
+        pdf.text "Meal Service            #{meal_hash[meals]}"
+        if record.STOPS > 0
+          pdf.text "Number of Stops        #{record.STOPS}"
+        else
+          pdf.text "Number of Stops      NON-STOP"
+        end
+
+        pdf.move_down 10
+        pdf.text "Baggage                   15K"
+      }
+      if (i==3) || (((i+1)%4)==0) then
+        pdf.start_new_page
+        #pdf.text @static_arr[1][i].inspect
+        #travel details first page block ends here
+        pdf.pad(20) {
+        # Travel Details START
+          pdf.bounding_box([GAP, pdf.cursor], :width => 520, :height => 120) do
+            pdf.text "Travel Details                                                #{record.DEPT_OR_CHECKIN.strftime("%A %d %b %y ")}", :size => 11, :color => "0B6CCF",:style=> :bold
+            
+            pdf.move_down 2
+            pdf.text "Flight Information", :size => 9,:style=> :bold
+            pdf.stroke_horizontal_rule
+            pdf.move_down 10
+            # Travel Details left start
+            pdf.bounding_box([0, pdf.cursor], :width => 300) do
+              left_details.call
+
+              # Travel Details right start
+              pdf.bounding_box([GAP  * 60, pdf.bounds.top], :width => 300) do
+
+                right_details.call
+              end# Travel Details right end
+            end# Travel Details left end
+          end # Travel Details END
+        }
+      #travel details first page block ends here
+      else
+      #travel details first page block ends here
+
+        pdf.pad(20) {
+        # Travel Details START
+          pdf.bounding_box([GAP, pdf.cursor], :width => 520, :height => 120) do
+           
+             
+        pdf.formatted_text [ { :text => "Travel Details ",:size => 11 ,:color => "0B6CCF",:styles => [:bold]}, 
+                 { :text => "                                     #{record.DEPT_OR_CHECKIN.strftime("%A %d %b %y ")} ",  :styles => [:bold],:color => "0B6CCF",:size => 9 }]
+            
+            
+            pdf.move_down 2
+            pdf.text "Flight Information", :size => 9,:style=> :bold
+            pdf.stroke_horizontal_rule
+            pdf.move_down 10
+            # Travel Details left start
+            pdf.bounding_box([0, pdf.cursor], :width => 300) do
+
+              left_details.call
+
+              # Travel Details right start
+              pdf.bounding_box([GAP  * 60, pdf.bounds.top], :width => 300) do
+
+                right_details.call
+
+              end# Travel Details right end
+            end# Travel Details left end
+          end # Travel Details END
+        }
+      #travel details first page block ends here
+      end
+    end
+  #travel details section starts here
+  end
+
+  def writeAirlineDetails(pdf)
+     
+     # @var = @record..uniq_by(:SUPPLIER_CDE)
+     tmp_var = []
+     @var = @record.uniq {|rec| rec.SUPPLIER_PNR}
+    puts @var.inspect
+    pdf.move_down 25
+    pdf.text "Airline Record Locators", :size => 9,:style=> :bold
+    pdf.stroke_horizontal_rule
+    @route =[]
+    @var.uniq.each do |flight|
+      @route << "#{flight.SRC_AP_CDE_OR_CITY_CDE} - #{flight.DEST_AP_CDE}/"
+      if !tmp_var.include? flight.SUPPLIER_PNR
+        pdf.move_down 5
+        pdf.text "#{flight.SUPPLIER_CDE}                                        #{flight.SUPPLIER_PNR}", :size => 8
+        tmp_var << flight.SUPPLIER_PNR
+      end
+    end
+    pdf.move_down 25
+    pdf.text "Airfare Information", :size => 9,:style=> :bold
+    pdf.stroke_horizontal_rule
+    pdf.move_down 5
+    pdf.text "Routing                           #{@route}".chop
+    pdf.text "Passenger Type              #{@var[0].PAX_TYPE}"
+    
+    with_db do |db|
+      res = db.query("SELECT IF(B.BREAK_UP_CDE = 'BF' OR B.BREAK_UP_CDE = 'YQ' OR B.BREAK_UP_CDE = 'YR', 'BF', (IF(B.BREAK_UP_CDE = 'JN', 'JN', 'DOTHERS'))) TAX, SUM(B.BREAK_UP_AMOUNT) AMT FROM PNR_BREAK_UP B, PNR_SEG_PAX P WHERE P.UID = B.IRISS_TRANS_UID AND  P.VENDOR_PNR = '5GJ80A' GROUP BY 1 WITH ROLLUP;")
+      while row = res.fetch_row do
+        pdf.text "Base Fare                       INR #{row[1].to_i}" if row[0] == "BF"
+        pdf.text "Airport Tax                      INR #{row[1].to_i}" if row[0] == "DOTHERS"
+        pdf.text "Govt Service Tax            INR #{row[1].to_i}" if row[0] == "JN"
+        row[0]
+        pdf.text "Total Cost                        INR #{row[1].to_i}" if row[0] == nil
+      end
+    end
+    
+    pdf.text "Fare Rules:"
+    pdf.text "Fare Type/Class              #{fareclass.chomp}  "
+    pdf.text "Minimum Stay                 N/A"
+    pdf.text "Maximum Stay                N/A"
+    pdf.text "Changes                         CHANGE FEE INR 1100 "
+    pdf.text "Cancellation                    ION"
+    pdf.text "Purchase At                    #{@record[0].CREATED_TMS.strftime("%H:%M HRS ON  %d %b %y ") }"
+    pdf.move_down 10
+  end
+
+  def writeHeader(pdf)
+    pdf.number_pages "Page <page> of <total>", { :start_count_at => 0, :page_filter => :all, :at => [pdf.bounds.right - 180, 780], :align => :right, :size => 8 }
+  end
+
+  def writeFooter(pdf)
+    pdf.bounding_box([0, 10], :width => 550, :height => 40) do
+      pdf.repeat :all do
+        pdf.draw_text "American Express Business Travel, American Express (India) Private Limited ", :size => 7, :at => [0,23]
+        pdf.draw_text "Registered Office Address: Metropolitan-Saket 7th Floor, Office Block, District Centre Saket, New Delhi 110017, India ", :size => 6.5, :at => [0,15]
+        pdf.move_down 5
+        pdf.pad_top(50){pdf.image "#{ IMG}/footer.png", :width => 180, :height => 25, :at => [360,30]}
+      end
+    end
+  end
+
+  def writeTandC(pdf)
+    pdf.text "Additional Messages", :size => 11,:style=> :bold
+    pdf.stroke_horizontal_rule
+    pdf.move_down 5
+    pdf.text "American Express Office and Communication Addresses",:style=> :bold
+    pdf.move_down 5
+
+    pdf.text "Gurgaon                      Cyber City, Tower C, DLF Building No. 8, 3rd Floor, Sector-25, DLF City phase II, Gurgaon, 122002
+                              Chennai                       Regus Citi Centre, 640 , Level 6, 10/11 Radhakrishnan Salai, Mylapore, Chennai, 600004
+                              Pune                            Regus Connaught Place, Level 2, Connaught Place, Bund Garden Road, Pune, 411001
+                              Mumbai                       One India Bulls Centre, Tower 2B,8th Floor, Jupiter Mills Compound ,Elphinston Road, Mumbai, 400013
+                              Bangalore                    Level 5 , Salapuria TechPoint No 30 , 100 Feet Road Koramangala , Bangalore 560 047"
+
+    pdf.move_down 10
+    pdf.move_down 5
+    pdf.text "Emergency Assistance", :size => 11,:style=> :bold
+    pdf.stroke_horizontal_rule
+    pdf.move_down 5
+
+    pdf.text "Travellers who need after hours emergency assistance, requiring a new reservation or changes to existing reservation, can call
+                            Emergency Travel Services. The contact numbers for these services are: "
+    pdf.text "Primary numbers           Toll Free 1800 419 1333"
+    pdf.text "Secondary Number        Toll Free 1800 180 6333"
+    pdf.move_down 5
+    pdf.text "From outside India - +91 124 6774171 / +91 124 4610171"
+    pdf.move_down 10
+
+    pdf.move_down 5
+    pdf.text "Domestic Travel Information", :size => 11,:style=> :bold
+    pdf.stroke_horizontal_rule
+    pdf.move_down 5
+
+    pdf.text "Please take the time to read prior to your flight, the following contains important information "
+    pdf.move_down 5
+
+    pdf.text "<color rgb='0B6CCF'>•   Check In:</color> Please check in at least 1 hour prior for domestic flights. We suggest onward reservations and flight times are reconfirmed 72 hours prior to departure. Due to heightened security the airlines check in time and reconfirmation policies may differ. We suggest you check with your airline for the latest information.", :inline_format => true, :align => :justify
+
+    #pdf.move_down 5
+    pdf.text "<color rgb='0B6CCF'>•   Electronic Tickets: </color>When travelling on an electronic ticket it is a requirement that you carry photo identification as acceptable by airlines. It is essential that the name on your ticket matches exactly the name as shown on your photo identification.", :inline_format => true, :align => :justify
+    #pdf.move_down 5
+    pdf.text "<color rgb='0B6CCF'>•   Seating & Meals: </color>Pre-assigned seating and special meal requests as shown on your itinerary are subject to confirmation upon check in and the airlines reserve the right to change this without notice at any time.", :inline_format => true, :align => :justify
+    #pdf.move_down 5
+    pdf.text "<color rgb='0B6CCF'>•   Checked Baggage & Quarantine: </color>Checked baggage policies vary by airline, booking class, frequent flyer status, baggage size and weight, including odd-shaped items and sports equipment. Fees will apply and payment is applicable at time of check in. There is also an International safety measure in place to protect travellers. Please refer to respective airlines' and countries' websites for further information on checked and restricted baggage policies/fees and quarantine items.", :inline_format => true, :align => :justify
+    #pdf.move_down 5
+    pdf.text "<color rgb='0B6CCF'>•   Pricing & Taxes: </color>All pricing and costs quoted are subject to change without notice due to airline/operator increases and/or currency fluctuations. Prices can only be guaranteed when paid in full and tickets and documents have been issued.", :inline_format => true, :align => :justify
+    #pdf.move_down 5
+    pdf.text "<color rgb='0B6CCF'>•   Travel Insurance: </color>It is strongly recommended to take out a Travel Insurance policy for all destinations. If you would like more information please contact your American Express Travel Consultant.", :inline_format => true, :align => :justify
+    #pdf.move_down 5
+    pdf.text "<color rgb='0B6CCF'>•   No Show / Cancellation Penalties: </color>You may incur an airline no-show fee if you fail to notify the airline or American Express travel that you are unable to travel on the flights you have booked. Additionally failure to cancel the flight reservation may deem your ticket unusable and non refundable.Certain categories of fares have penalties applicable if cancellation within stipulated time. If not cancelled within these time-frames, the ticket is deemed No Show.", :inline_format => true, :align => :justify
+    #pdf.move_down 5
+    pdf.text "<color rgb='0B6CCF'>•   Frequent Flyer: </color>Please retain your boarding passes to assist in the reconciliation of your frequent flyer statements. At time of check in the airline can reconfirm that your frequent flyer number is entered.", :inline_format => true, :align => :justify
+    #pdf.move_down 5
+    pdf.text "<color rgb='0B6CCF'>•   Itinerary:</color>To view your itinerary on the internet, log on to <link href='www.mytravelplans.co.in/'><color rgb='0B6CCF'>www.mytravelplans.co.in</color></link> - to access your booking you will need your Booking Reference which is detailed on your American Express itinerary.", :inline_format => true, :align => :justify
+    pdf.move_down 10
+
+    pdf.move_down 5
+    pdf.text "Important Information", :size => 11,:style=> :bold
+    pdf.stroke_horizontal_rule
+    pdf.move_down 5
+
+    pdf.text "Please take time to read, the following contains important information"
+    pdf.move_down 5
+    pdf.text "<color rgb='0B6CCF'>•   Travel Intermediary Disclosure:</color> Travel Intermediary Disclosure American Express (AMEX) helps manage your companys travel expenses and assists you in finding travel suppliers and making arrangements that meet your individual needs. We consider various factors in identifying travel suppliers and recommending specific itineraries. In this role, we are acting as an independent third party and not as a fiduciary. We want you to be aware that certain suppliers pay us commissions as well as incentives for reaching sales targets or other goals, and from time to time may also provide incentives to our travel counsellors. Certain suppliers may also provide compensation to us for various marketing and administrative services that we perform for them, such as granting them access to our marketing channels, participating in marketing programs and supporting technology initiatives. In addition, we receive compensation from suppliers when customers use the American Express Card or other American Express products to pay for supplier products and services. From time to time we may enter into other business relationships with suppliers and these arrangements, including levels and types of compensation and incentives we receive, are subject to change. In identifying suppliers and recommending itineraries, we may consider a number of factors; including supplier availability, your preferences, and any agreements we have to book travel in accordance with your companys travel policy. The relationships we have with suppliers may also influence the suppliers we identify and the itineraries we recommend.", :inline_format => true, :align => :justify
+    pdf.move_down 5
+    pdf.text "<color rgb='0B6CCF'>•   Liability Statement:  </color>American Express (AMEX) acts only as agent for the airlines hotels and other contractors providing services (suppliers). By using the services on this itinerary the client agrees that neither AMEX nor its related companies employees or representatives shall be liable for any loss, costs, expense, injury, accident or damage to person or property resulting directly or indirectly from (a) the acts or omissions of such suppliers (b) acts of god or (c) any other cause beyond AMEX control.", :inline_format => true, :align => :justify
+    pdf.move_down 5
+    pdf.text "<color rgb='0B6CCF'>•   Privacy: </color>For American Express Privacy Policy please refer to <link href='www.americanexpress.com/india/legal/privacy.shtml'><color rgb='0B6CCF'>www.americanexpress.com/india/legal/privacy.shtml</color></link>", :inline_format => true, :align => :justify
+    pdf.move_down 10
+
+    pdf.move_down 5
+    pdf.text "Your Feedback Shapes our Business", :size => 11,:style=> :bold
+    pdf.move_down 5
+    pdf.text "As your travel service provider, American Express Business Travel and our representatives are committed to assuring your satisfaction.Kindly share your experience with us on the below link", :size => 8, :align => :justify
+    pdf.text "", :size => 8
+    pdf.text "<link href='http://amexbusinesstravel.force.com'>http://amexbusinesstravel.force.com</link>", :inline_format => true, :align => :justify, :size => 8, :color => "0B6CCF"
+
+  end
+
+  def generate_pdf
+    Prawn::Document.generate("#{@gdsPnr}.pdf", :page_size => 'A4', :page_layout => :portrait) do |pdf|
+      pdf.font_size(6)
+      writeAgentHeader(pdf)
+      writeAgentDetails(pdf)
+      writeTravelDetails(pdf)
+      writeAirlineDetails(pdf)
+      writeTandC(pdf)
+      writeHeader(pdf)
+      writeFooter(pdf)
+    end# prawn end
+  end
+
+end#class end
+
+class String
+  def initial
+    self[0,1]
+  end
+end
+
+private
+
+def fares(code)
+  @count = []
+  @record.each do |rec|
+    @count << rec.PNR_BREAK_UP.sum(:BREAK_UP_AMOUNT,:conditions => "BREAK_UP_CDE = '#{code}'")
+  end
+  @count.inject{|sum,x| sum + x }
+end
+
+def meal_service(code)
+
+end
+
+def fareclass()
+  @fare_class = []
+  fc = ["F","P"]
+  bussiness = ["D","C","J"]
+  corp =  ["S","R"]
+  flexi =  ["E","G","H"]
+  retail =  ["Y","U","O","Q","B","Z","K","L","M"]
+  promo = ["V","W","T"]
+  splfare = ["X", "N"]
+  @fares = []
+  @data = []
+  @record.each do |rec|
+    @fares << rec.FARE_CLASS.initial
+  end
+
+  @fares.uniq.each do |fare|
+
+    if  fc.include?fare.initial
+      @fare_class << "First Class"
+    elsif  bussiness.include?fare.initial
+      @fare_class << "Bussiness"
+    elsif  corp.include?fare.initial
+      @fare_class << "Corporate"
+    elsif  flexi.include?fare.initial
+      @fare_class << "Flexi Class"
+    elsif  retail.include?fare.initial
+      @fare_class << "Retail"
+    elsif  promo.include?fare.initial
+      @fare_class << "Promotional"
+    elsif splfare.include? fare
+      @fare_class = ["Spl. Roundtrip fare"]
+    break
+    end
+  end
+  return @fare_class.join(" / ")
+end
+
+def estimated_time(at,dt)
+  arri_time = at
+  dept_time = dt
+  seconds = (arri_time.to_i - dept_time.to_i)
+  # days = seconds / 86400;
+  hours = seconds / 3600;
+  minutes = (seconds - (hours * 3600)) / 60;
+  seconds = (seconds - (hours * 3600) - (minutes * 60));
+  time = {:hours=>hours,:minutes=>minutes}
+  return time
+end
+
+ticket = PrintTicket.new("5GJ80A")
+ticket.generate_pdf
